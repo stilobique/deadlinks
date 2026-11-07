@@ -1,4 +1,6 @@
+import json
 import logging
+from pathlib import Path
 
 from bs4 import BeautifulSoup
 import requests
@@ -23,6 +25,10 @@ SPAN_WARNING = '<span class="label label-warning"></span>'
 SPAN_DANGER = '<span class="label label-danger"></span>'
 ARCHIVE_URL = "https://web.archive.org/web/*/{url}"
 
+# Every issue found during the build, written on disk at the end of the run
+# when the `DEADLINKS_REPORT_PATH` setting is defined.
+REPORT = {}
+
 
 def get_status_code(url, opts):
     """Open connection to the given url and check status code.
@@ -32,17 +38,30 @@ def get_status_code(url, opts):
     """
     availibility, success, code = (False, False, None)
     timeout_duration_seconds = get_opt(opts, "timeout_duration_ms") / MS_IN_SECOND
+
+    # TODO
+    headers = {
+        "User-Agent":
+            "GraouStudio-DeadlinkChecker/1.0 (https://graou.studio; "
+            "contact@graou.studio)"
+    }
     try:
-        r = requests.get(url, timeout=timeout_duration_seconds)
+        log.info(" - Try external url - ")
+        r = requests.get(url, timeout=timeout_duration_seconds, headers=headers)
+        log.info(f"\tUrl: {url}")
+        log.info(f"\tStatus code: {r.status_code}")
         code = r.status_code
         availibility = True
         success = code == requests.codes.ok
+
     except Timeout:
         availibility = False
         success = UNKNOWN
+
     except RequestException:
         availibility = UNKNOWN
         success = False
+
     return (availibility, success, code)
 
 
@@ -123,6 +142,45 @@ def on_access_error(anchor, code, opts):
         change_to_archive(anchor)
 
 
+def record(instance, url, status, code=None):
+    """Store an issue for the final report (deduplicated per source and url)."""
+    source = getattr(instance, "relative_source_path", None) or str(
+        getattr(instance, "source_path", "?")
+    )
+    REPORT[(source, url)] = {
+        "source": source,
+        "lang": getattr(instance, "lang", None),
+        "url": url,
+        "status": status,
+        "code": code,
+    }
+
+
+def write_report(pelican):
+    """Write the collected issues as JSON and Markdown files."""
+    path = pelican.settings.get("DEADLINKS_REPORT_PATH")
+    if not path:
+        return
+    folder = Path(path)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    issues = sorted(REPORT.values(), key=lambda i: (i["source"], i["url"]))
+    (folder / "deadlinks.json").write_text(
+        json.dumps(issues, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    lines = ["# Deadlinks report", "", f"{len(issues)} issue(s) found.", ""]
+    if issues:
+        lines += ["| Source | Lang | Status | Code | Url |", "|---|---|---|---|---|"]
+        lines += [
+            f"| {i['source']} | {i['lang'] or ''} | {i['status']} "
+            f"| {i['code'] or ''} | {i['url']} |"
+            for i in issues
+        ]
+    (folder / "deadlinks.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log.info(f"Deadlinks report written in {folder} ({len(issues)} issue(s))")
+
+
 def content_object_init(instance):  # noqa: PLR0912
     """Pelican callback."""
     if instance._content is None:
@@ -154,6 +212,7 @@ def content_object_init(instance):  # noqa: PLR0912
 
             if not state:
                 log.error(f'This internal url are broken {url}.')
+                record(instance, url, "broken-anchor")
             continue
 
         # Previous case works also for debugging environment (with SITEURL
@@ -168,6 +227,7 @@ def content_object_init(instance):  # noqa: PLR0912
             avail, success, code = cache[url]
         else:
             # TODO: No reason to query for sites from already timed-out domain
+            log.info(f'Url {url} not cached')
             avail, success, code = get_status_code(url, opts)
             cache[url] = (avail, success, code)
 
@@ -175,14 +235,17 @@ def content_object_init(instance):  # noqa: PLR0912
             timeout_is_error = get_opt(opts, "timeout_is_error")
             if timeout_is_error:
                 log.warning(f'Dead link: {url} (not available)')
+                record(instance, url, "unavailable")
                 on_connection_error(anchor, opts)
             else:
                 log.warning(f'Skipping: {url} (not available)')
+                record(instance, url, "timeout")
             continue
 
         elif not success:
             if code >= 400 and code < 500:  # noqa: PLR2004
                 log.warning(f'Dead link: {url} (error code: {code})')
+                record(instance, url, "dead", code)
                 on_access_error(anchor, code, opts)
                 continue
             else:
@@ -198,3 +261,4 @@ def content_object_init(instance):  # noqa: PLR0912
 def register():
     """Register the plugin."""
     signals.content_object_init.connect(content_object_init)
+    signals.finalized.connect(write_report)
